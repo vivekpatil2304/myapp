@@ -1,0 +1,346 @@
+name: CI/CD Blue Green Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: myapp
+
+jobs:
+
+  # ==========================================
+  # BUILD & PUSH DOCKER IMAGE
+  # ==========================================
+
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+
+      # Checkout source code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Configure AWS
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Login to ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build Docker image
+      - name: Build Docker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            .
+
+      # Push Docker image
+      - name: Push Docker image to ECR
+        id: image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+
+          IMAGE=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          docker push $IMAGE
+
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+          echo "Docker image pushed:"
+          echo "$IMAGE"
+
+
+  # ==========================================
+  # BLUE GREEN DEPLOYMENT
+  # ==========================================
+
+  deploy:
+    name: Blue Green Deployment
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.0
+
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+
+          script: |
+
+            set -e
+
+            echo "===================================="
+            echo "Starting Blue Green Deployment"
+            echo "===================================="
+
+            AWS_REGION="${{ env.AWS_REGION }}"
+            ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
+            IMAGE_TAG="${{ github.sha }}"
+
+            echo "AWS Region: $AWS_REGION"
+            echo "Repository: $ECR_REPOSITORY"
+            echo "Image Tag: $IMAGE_TAG"
+
+
+            # ==========================================
+            # AWS / ECR
+            # ==========================================
+
+            ACCOUNT_ID=$(aws sts get-caller-identity \
+              --query Account \
+              --output text)
+
+            ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+            IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+            echo "Docker Image:"
+            echo "$IMAGE"
+
+
+            # Login to ECR
+
+            aws ecr get-login-password \
+              --region "$AWS_REGION" | \
+              docker login \
+              --username AWS \
+              --password-stdin "$ECR_REGISTRY"
+
+
+            # Pull new image
+
+            echo "Pulling Docker image..."
+
+            docker pull "$IMAGE"
+
+
+            # ==========================================
+            # DETERMINE ACTIVE ENVIRONMENT
+            # ==========================================
+
+            if grep -q "127.0.0.1:8081" /etc/nginx/sites-available/myapp; then
+
+                ACTIVE="blue"
+                TARGET="green"
+
+            else
+
+                ACTIVE="green"
+                TARGET="blue"
+
+            fi
+
+
+            echo "Current active environment: $ACTIVE"
+            echo "Deploying new version to: $TARGET"
+
+
+            # ==========================================
+            # SET TARGET CONTAINER / PORT
+            # ==========================================
+
+            if [ "$TARGET" = "green" ]; then
+
+                TARGET_CONTAINER="myapp-green"
+                TARGET_PORT="8082"
+
+            else
+
+                TARGET_CONTAINER="myapp-blue"
+                TARGET_PORT="8081"
+
+            fi
+
+
+            echo "Target container: $TARGET_CONTAINER"
+            echo "Target port: $TARGET_PORT"
+
+
+            # ==========================================
+            # STOP OLD TARGET CONTAINER
+            # ==========================================
+
+            echo "Removing old $TARGET container..."
+
+            docker rm -f "$TARGET_CONTAINER" 2>/dev/null || true
+
+
+            # ==========================================
+            # START NEW CONTAINER
+            # ==========================================
+
+            echo "Starting new container..."
+
+            docker run -d \
+              --name "$TARGET_CONTAINER" \
+              --restart unless-stopped \
+              -p "$TARGET_PORT:5000" \
+              "$IMAGE"
+
+
+            # ==========================================
+            # WAIT FOR APPLICATION
+            # ==========================================
+
+            echo "Waiting for application to start..."
+
+            sleep 10
+
+
+            # ==========================================
+            # HEALTH CHECK
+            # ==========================================
+
+            echo "Running health check..."
+
+            HEALTH_URL="http://127.0.0.1:${TARGET_PORT}/health"
+
+            echo "Checking:"
+            echo "$HEALTH_URL"
+
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 10 \
+              "$HEALTH_URL"; then
+
+                echo ""
+                echo "===================================="
+                echo "Health check PASSED"
+                echo "===================================="
+
+            else
+
+                echo ""
+                echo "===================================="
+                echo "Health check FAILED"
+                echo "===================================="
+
+                echo "Container logs:"
+
+                docker logs "$TARGET_CONTAINER"
+
+                echo "Removing failed container..."
+
+                docker rm -f "$TARGET_CONTAINER"
+
+                exit 1
+
+            fi
+
+
+            # ==========================================
+            # SWITCH NGINX TRAFFIC
+            # ==========================================
+
+            echo "Switching Nginx traffic..."
+
+
+            if [ "$TARGET" = "green" ]; then
+
+                sudo sed -i \
+                  's/127.0.0.1:8081/127.0.0.1:8082/' \
+                  /etc/nginx/sites-available/myapp
+
+            else
+
+                sudo sed -i \
+                  's/127.0.0.1:8082/127.0.0.1:8081/' \
+                  /etc/nginx/sites-available/myapp
+
+            fi
+
+
+            # ==========================================
+            # TEST NGINX CONFIG
+            # ==========================================
+
+            echo "Testing Nginx configuration..."
+
+            sudo nginx -t
+
+
+            # ==========================================
+            # RELOAD NGINX
+            # ==========================================
+
+            echo "Reloading Nginx..."
+
+            sudo systemctl reload nginx
+
+
+            # ==========================================
+            # VERIFY TRAFFIC
+            # ==========================================
+
+            echo "Verifying application through Nginx..."
+
+            sleep 2
+
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 10 \
+              http://127.0.0.1/health
+
+
+            echo ""
+            echo "===================================="
+            echo "Deployment successful!"
+            echo "Active environment: $TARGET"
+            echo "===================================="
+
+
+            # ==========================================
+            # REMOVE OLD ACTIVE CONTAINER
+            # ==========================================
+
+            if [ "$ACTIVE" = "blue" ]; then
+
+                OLD_CONTAINER="myapp-blue"
+
+            else
+
+                OLD_CONTAINER="myapp-green"
+
+            fi
+
+
+            echo "Removing old container: $OLD_CONTAINER"
+
+            docker rm -f "$OLD_CONTAINER" 2>/dev/null || true
+
+
+            # ==========================================
+            # CLEAN UNUSED IMAGES
+            # ==========================================
+
+            echo "Cleaning unused Docker images..."
+
+            docker image prune -f
